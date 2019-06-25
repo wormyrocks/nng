@@ -23,6 +23,9 @@ typedef struct nni_ws_dialer   nni_ws_dialer;
 // This is a boolean.
 #define NNI_OPT_WS_MSGMODE "ws:msgmode"
 
+// Sets websocket header into text mode.
+#define NNI_OPT_WS_TEXTMODE "ws:textmode"
+
 // Specify URL as ws://[<host>][:port][/path]
 // If host is missing, INADDR_ANY is assumed.  If port is missing,
 // then either 80 or 443 are assumed.  Note that ws:// means listen

@@ -518,6 +518,8 @@ wstran_dialer_init(void **dp, nng_url *url, nni_dialer *ndialer)
 	    ((rv = nni_aio_init(&d->connaio, wstran_connect_cb, d)) != 0) ||
 	    ((rv = nng_stream_dialer_set_bool(
 	          d->dialer, NNI_OPT_WS_MSGMODE, true)) != 0) ||
+	    ((rv = nng_stream_dialer_set_bool(
+	          d->dialer, NNI_OPT_WS_TEXTMODE, false)) != 0) ||
 	    ((rv = nng_stream_dialer_set_string(
 	          d->dialer, NNG_OPT_WS_PROTOCOL, prname)) != 0)) {
 		wstran_dialer_fini(d);
@@ -554,6 +556,8 @@ wstran_listener_init(void **lp, nng_url *url, nni_listener *nlistener)
 	    ((rv = nni_aio_init(&l->accaio, wstran_accept_cb, l)) != 0) ||
 	    ((rv = nng_stream_listener_set_bool(
 	          l->listener, NNI_OPT_WS_MSGMODE, true)) != 0) ||
+	    ((rv = nng_stream_listener_set_bool(
+	          l->listener, NNI_OPT_WS_TEXTMODE, false)) != 0) ||
 	    ((rv = nng_stream_listener_set_string(
 	          l->listener, NNG_OPT_WS_PROTOCOL, prname)) != 0)) {
 		wstran_listener_fini(l);
