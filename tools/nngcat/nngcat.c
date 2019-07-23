@@ -312,7 +312,7 @@ loadfile(const char *path, void **datap, size_t *lenp)
 	char * data;
 	size_t len;
 
-	if ((f = fopen(path, "r")) == NULL) {
+	if ((f = fopen(path, "rb")) == NULL) {
 		fatal("Cannot open file %s: %s", path, strerror(errno));
 	}
 	if (fseek(f, 0, SEEK_END) != 0) {
@@ -324,9 +324,10 @@ loadfile(const char *path, void **datap, size_t *lenp)
 		fatal("Out of memory.");
 	}
 	data[len] = '\0';
+	size_t out = fread(data, 1, len, f);
 
-	if (fread(data, 1, len, f) != len) {
-		fatal("Read file %s failed: %s", path, strerror(errno));
+	if (out != len) {
+		fatal("Read file %s failed: %s, expected %d bytes, got %d bytes", path, strerror(errno), len, out);
 	}
 	fclose(f);
 	*datap = data;
