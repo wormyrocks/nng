@@ -542,9 +542,15 @@ http_sconn_rxdone(void *arg)
 			}
 
 			len = strlen(h->host);
+
+			// HACK: disable host address checking; allows us to match
+			// localhost: with 127.0.0.1
+			
+			/*
 			if ((nni_strncasecmp(host, h->host, len) != 0)) {
 				continue;
 			}
+			*/
 
 			// At least the first part matches.  If the ending
 			// part is a lone "." (legal in DNS), or a port
