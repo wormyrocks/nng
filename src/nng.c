@@ -626,7 +626,8 @@ nng_setopt(nng_socket s, const char *name, const void *val, size_t sz)
 }
 
 static int
-nni_socket_getx(nng_socket s, const char *name, void *val, size_t *szp, nni_type t)
+nni_socket_getx(
+    nng_socket s, const char *name, void *val, size_t *szp, nni_type t)
 {
 	nni_sock *sock;
 	int       rv;
@@ -816,6 +817,7 @@ static const struct {
 	{ NNG_ENOARG, "Option requires argument" },
 	{ NNG_EAMBIGUOUS, "Ambiguous option" },
 	{ NNG_EBADTYPE, "Incorrect type" },
+	{ NNG_ECONNSHUT, "Connection shutdown" },
 	{ NNG_EINTERNAL, "Internal error detected" },
 	{ 0, NULL },
 	// clang-format on
@@ -1114,7 +1116,7 @@ nng_aio_alloc(nng_aio **app, void (*cb)(void *), void *arg)
 	if ((rv = nni_init()) != 0) {
 		return (rv);
 	}
-	if ((rv = nni_aio_init(&aio, (nni_cb) cb, arg)) == 0) {
+	if ((rv = nni_aio_alloc(&aio, (nni_cb) cb, arg)) == 0) {
 		nng_aio_set_timeout(aio, NNG_DURATION_DEFAULT);
 		*app = aio;
 	}
@@ -1124,7 +1126,7 @@ nng_aio_alloc(nng_aio **app, void (*cb)(void *), void *arg)
 void
 nng_aio_free(nng_aio *aio)
 {
-	nni_aio_fini(aio);
+	nni_aio_free(aio);
 }
 
 void

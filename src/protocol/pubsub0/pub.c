@@ -1,5 +1,5 @@
 //
-// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2020 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 //
 // This software is supplied under the terms of the MIT License, a
@@ -9,6 +9,7 @@
 //
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "core/nng_impl.h"
@@ -63,27 +64,21 @@ pub0_sock_fini(void *arg)
 
 	nni_pollable_free(s->sendable);
 	nni_mtx_fini(&s->mtx);
-	NNI_FREE_STRUCT(s);
 }
 
 static int
-pub0_sock_init(void **sp, nni_sock *nsock)
+pub0_sock_init(void *arg, nni_sock *nsock)
 {
-	pub0_sock *sock;
+	pub0_sock *sock = arg;
 	int        rv;
 	NNI_ARG_UNUSED(nsock);
 
-	if ((sock = NNI_ALLOC_STRUCT(sock)) == NULL) {
-		return (NNG_ENOMEM);
-	}
 	if ((rv = nni_pollable_alloc(&sock->sendable)) != 0) {
-		NNI_FREE_STRUCT(sock);
 		return (rv);
 	}
 	nni_mtx_init(&sock->mtx);
 	NNI_LIST_INIT(&sock->pipes, pub0_pipe, node);
 	sock->sendbuf = 16; // fairly arbitrary
-	*sp           = sock;
 	return (0);
 }
 
@@ -96,11 +91,7 @@ pub0_sock_open(void *arg)
 static void
 pub0_sock_close(void *arg)
 {
-	pub0_sock *sock = arg;
-
-	nni_mtx_lock(&sock->mtx);
-	sock->closed = true;
-	nni_mtx_unlock(&sock->mtx);
+	NNI_ARG_UNUSED(arg);
 }
 
 static void
@@ -117,23 +108,18 @@ pub0_pipe_fini(void *arg)
 {
 	pub0_pipe *p = arg;
 
-	nni_aio_fini(p->aio_send);
-	nni_aio_fini(p->aio_recv);
+	nni_aio_free(p->aio_send);
+	nni_aio_free(p->aio_recv);
 	nni_lmq_fini(&p->sendq);
-	NNI_FREE_STRUCT(p);
 }
 
 static int
-pub0_pipe_init(void **pp, nni_pipe *pipe, void *s)
+pub0_pipe_init(void *arg, nni_pipe *pipe, void *s)
 {
-	pub0_pipe *p;
+	pub0_pipe *p = arg;
 	pub0_sock *sock = s;
 	int        rv;
 	size_t     len;
-
-	if ((p = NNI_ALLOC_STRUCT(p)) == NULL) {
-		return (NNG_ENOMEM);
-	}
 
 	nni_mtx_lock(&sock->mtx);
 	len = sock->sendbuf;
@@ -141,8 +127,8 @@ pub0_pipe_init(void **pp, nni_pipe *pipe, void *s)
 
 	// XXX: consider making this depth tunable
 	if (((rv = nni_lmq_init(&p->sendq, len)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_send, pub0_pipe_send_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_recv, pub0_pipe_recv_cb, p)) != 0)) {
+	    ((rv = nni_aio_alloc(&p->aio_send, pub0_pipe_send_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_recv, pub0_pipe_recv_cb, p)) != 0)) {
 
 		pub0_pipe_fini(p);
 		return (rv);
@@ -151,7 +137,6 @@ pub0_pipe_init(void **pp, nni_pipe *pipe, void *s)
 	p->busy = false;
 	p->pipe = pipe;
 	p->pub  = s;
-	*pp     = p;
 	return (0);
 }
 
@@ -198,15 +183,12 @@ pub0_pipe_recv_cb(void *arg)
 {
 	pub0_pipe *p = arg;
 
-	if (nni_aio_result(p->aio_recv) != 0) {
-		nni_pipe_close(p->pipe);
-		return;
+	// We should never receive a message -- the only valid reason for us to
+	// be here is on pipe close.
+	if (nni_aio_result(p->aio_recv) == 0) {
+		nni_msg_free(nni_aio_get_msg(p->aio_recv));
 	}
-
-	// We should never get any messages.  If we do we just dicard them.
-	nni_msg_free(nni_aio_get_msg(p->aio_recv));
-	nni_aio_set_msg(p->aio_recv, NULL);
-	nni_pipe_recv(p->pipe, p->aio_recv);
+	nni_pipe_close(p->pipe);
 }
 
 static void
@@ -224,7 +206,7 @@ pub0_pipe_send_cb(void *arg)
 	}
 
 	nni_mtx_lock(&sock->mtx);
-	if (sock->closed || p->closed) {
+	if (p->closed) {
 		nni_mtx_unlock(&sock->mtx);
 		return;
 	}
@@ -258,18 +240,7 @@ pub0_sock_send(void *arg, nni_aio *aio)
 	msg = nni_aio_get_msg(aio);
 	len = nni_msg_len(msg);
 	nni_mtx_lock(&sock->mtx);
-	if (sock->closed) {
-		nni_mtx_unlock(&sock->mtx);
-		nni_aio_finish_error(aio, NNG_ECLOSED);
-		return;
-	}
 	NNI_LIST_FOREACH (&sock->pipes, p) {
-		if (p->closed) {
-			continue;
-		}
-		if (nni_lmq_full(&p->sendq)) {
-			continue;
-		}
 		if (p == nni_list_last(&sock->pipes)) {
 			dup = msg;
 			msg = NULL;
@@ -277,6 +248,12 @@ pub0_sock_send(void *arg, nni_aio *aio)
 			continue;
 		}
 		if (p->busy) {
+			if (nni_lmq_full(&p->sendq)) {
+				// Make space for the new message.
+				nni_msg * old;
+				(void) nni_lmq_getq(&p->sendq, &old);
+				nni_msg_free(old);
+			}
 			nni_lmq_putq(&p->sendq, dup);
 		} else {
 			p->busy = true;
@@ -298,7 +275,7 @@ pub0_sock_get_sendfd(void *arg, void *buf, size_t *szp, nni_type t)
 	int        fd;
 	int        rv;
 	nni_mtx_lock(&sock->mtx);
-	// PUB sockets are *always* sendable.
+	// PUB sockets are *always* writable.
 	nni_pollable_raise(sock->sendable);
 	rv = nni_pollable_getfd(sock->sendable, &fd);
 	nni_mtx_unlock(&sock->mtx);
@@ -328,7 +305,7 @@ pub0_sock_set_sendbuf(void *arg, const void *buf, size_t sz, nni_type t)
 		// stop short.  The others would likely fail for ENOMEM as
 		// well anyway.  There is a weird effect here where the
 		// buffers may have been set for *some* of the pipes, but
-		// we have no way to correct, or even report, partial failure.
+		// we have no way to correct partial failure.
 		if ((rv = nni_lmq_resize(&p->sendq, (size_t) val)) != 0) {
 			break;
 		}
@@ -349,6 +326,7 @@ pub0_sock_get_sendbuf(void *arg, void *buf, size_t *szp, nni_type t)
 }
 
 static nni_proto_pipe_ops pub0_pipe_ops = {
+    .pipe_size = sizeof (pub0_pipe),
 	.pipe_init  = pub0_pipe_init,
 	.pipe_fini  = pub0_pipe_fini,
 	.pipe_start = pub0_pipe_start,
@@ -373,6 +351,7 @@ static nni_option pub0_sock_options[] = {
 };
 
 static nni_proto_sock_ops pub0_sock_ops = {
+    .sock_size = sizeof (pub0_sock),
 	.sock_init    = pub0_sock_init,
 	.sock_fini    = pub0_sock_fini,
 	.sock_open    = pub0_sock_open,

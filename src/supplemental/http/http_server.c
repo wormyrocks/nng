@@ -32,16 +32,17 @@ static nni_initializer http_server_initializer = {
 };
 
 struct nng_http_handler {
-	nni_list_node node;
-	char *        uri;
-	char *        method;
-	char *        host;
-	bool          tree;
-	int           refcnt;
-	size_t        maxbody;
-	bool          getbody;
-	void *        data;
-	nni_cb        dtor;
+	nni_list_node   node;
+	char *          uri;
+	char *          method;
+	char *          host;
+	bool            tree;
+	nni_atomic_u64  ref;
+	nni_atomic_bool busy;
+	size_t          maxbody;
+	bool            getbody;
+	void *          data;
+	nni_cb          dtor;
 	void (*cb)(nni_aio *);
 };
 
@@ -96,6 +97,9 @@ nni_http_handler_init(
 	if ((h = NNI_ALLOC_STRUCT(h)) == NULL) {
 		return (NNG_ENOMEM);
 	}
+	nni_atomic_init64(&h->ref);
+	nni_atomic_inc64(&h->ref);
+
 	// Default for HTTP is /.  But remap it to "" for ease of matching.
 	if ((uri == NULL) || (strlen(uri) == 0) || (strcmp(uri, "/") == 0)) {
 		uri = "";
@@ -111,17 +115,18 @@ nni_http_handler_init(
 	h->dtor    = NULL;
 	h->host    = NULL;
 	h->tree    = false;
-	h->refcnt  = 0;
 	h->maxbody = 1024 * 1024; // By default we accept up to 1MB of body
 	h->getbody = true;
 	*hp        = h;
 	return (0);
 }
 
+// nni_http_handler_fini just drops the reference count, only destroying
+// the handler if the reference drops to zero.
 void
 nni_http_handler_fini(nni_http_handler *h)
 {
-	if (h->refcnt != 0) {
+	if (nni_atomic_dec64_nv(&h->ref) != 0) {
 		return;
 	}
 	if (h->dtor != NULL) {
@@ -143,7 +148,7 @@ nni_http_handler_collect_body(nni_http_handler *h, bool want, size_t maxbody)
 int
 nni_http_handler_set_data(nni_http_handler *h, void *data, nni_cb dtor)
 {
-	if (h->refcnt != 0) {
+	if (nni_atomic_get_bool(&h->busy)) {
 		return (NNG_EBUSY);
 	}
 	h->data = data;
@@ -169,7 +174,7 @@ nni_http_handler_get_uri(nni_http_handler *h)
 int
 nni_http_handler_set_tree(nni_http_handler *h)
 {
-	if (h->refcnt != 0) {
+	if (nni_atomic_get_bool(&h->busy) != 0) {
 		return (NNG_EBUSY);
 	}
 	h->tree = true;
@@ -179,8 +184,9 @@ nni_http_handler_set_tree(nni_http_handler *h)
 int
 nni_http_handler_set_host(nni_http_handler *h, const char *host)
 {
-	char *duphost;
-	if (h->refcnt != 0) {
+	char *dup;
+
+	if (nni_atomic_get_bool(&h->busy) != 0) {
 		return (NNG_EBUSY);
 	}
 	if (host == NULL) {
@@ -188,19 +194,20 @@ nni_http_handler_set_host(nni_http_handler *h, const char *host)
 		h->host = NULL;
 		return (0);
 	}
-	if ((duphost = nni_strdup(host)) == NULL) {
+	if ((dup = nni_strdup(host)) == NULL) {
 		return (NNG_ENOMEM);
 	}
 	nni_strfree(h->host);
-	h->host = duphost;
+	h->host = dup;
 	return (0);
 }
 
 int
 nni_http_handler_set_method(nni_http_handler *h, const char *method)
 {
-	char *dupmeth;
-	if (h->refcnt != 0) {
+	char *dup;
+
+	if (nni_atomic_get_bool(&h->busy) != 0) {
 		return (NNG_EBUSY);
 	}
 	if (method == NULL) {
@@ -208,11 +215,11 @@ nni_http_handler_set_method(nni_http_handler *h, const char *method)
 		h->method = NULL;
 		return (0);
 	}
-	if ((dupmeth = nni_strdup(method)) == NULL) {
+	if ((dup = nni_strdup(method)) == NULL) {
 		return (NNG_ENOMEM);
 	}
 	nni_strfree(h->method);
-	h->method = dupmeth;
+	h->method = dup;
 	return (0);
 }
 
@@ -236,10 +243,10 @@ http_sconn_reap(void *arg)
 	}
 	nni_http_req_free(sc->req);
 	nni_http_res_free(sc->res);
-	nni_aio_fini(sc->rxaio);
-	nni_aio_fini(sc->txaio);
-	nni_aio_fini(sc->txdataio);
-	nni_aio_fini(sc->cbaio);
+	nni_aio_free(sc->rxaio);
+	nni_aio_free(sc->txaio);
+	nni_aio_free(sc->txdataio);
+	nni_aio_free(sc->cbaio);
 
 	// Now it is safe to release our reference on the server.
 	nni_mtx_lock(&s->mtx);
@@ -656,7 +663,9 @@ finish:
 		return;
 	}
 	nni_aio_set_data(sc->cbaio, 1, h);
-	h->refcnt++;
+	// Set a reference -- this because the callback may be running
+	// asynchronously even after it gets removed from the server.
+	nni_atomic_inc64(&h->ref);
 	nni_mtx_unlock(&s->mtx);
 	h->cb(sc->cbaio);
 }
@@ -670,23 +679,25 @@ http_sconn_cbdone(void *arg)
 	nni_http_handler *h;
 	nni_http_server * s = sc->server;
 
+	// Get the handler.  It may be set regardless of success or
+	// failure.  Clear it, and drop our reference, since we're
+	// done with the handler for now.
+	h   = nni_aio_get_data(aio, 1);
+	nni_aio_set_data(aio, 1, NULL);
+
+	if (h != NULL) {
+		nni_http_handler_fini(h);
+	}
+
 	if (nni_aio_result(aio) != 0) {
 		// Hard close, no further feedback.
 		http_sconn_close(sc);
 		return;
 	}
 
-	h   = nni_aio_get_data(aio, 1);
 	res = nni_aio_get_output(aio, 0);
 
-	nni_mtx_lock(&s->mtx);
-	h->refcnt--;
-	if (h->refcnt == 0) {
-		nni_http_handler_fini(h);
-	}
-	nni_mtx_unlock(&s->mtx);
-
-	// If its an upgrader, and they didn't give us back a response,
+	// If it's an upgrader, and they didn't give us back a response,
 	// it means that they took over, and we should just discard
 	// this session, without closing the underlying channel.
 	if (sc->conn == NULL) {
@@ -741,11 +752,11 @@ http_sconn_init(http_sconn **scp, nng_stream *stream)
 	}
 
 	if (((rv = nni_http_req_alloc(&sc->req, NULL)) != 0) ||
-	    ((rv = nni_aio_init(&sc->rxaio, http_sconn_rxdone, sc)) != 0) ||
-	    ((rv = nni_aio_init(&sc->txaio, http_sconn_txdone, sc)) != 0) ||
-	    ((rv = nni_aio_init(&sc->txdataio, http_sconn_txdatdone, sc)) !=
+	    ((rv = nni_aio_alloc(&sc->rxaio, http_sconn_rxdone, sc)) != 0) ||
+	    ((rv = nni_aio_alloc(&sc->txaio, http_sconn_txdone, sc)) != 0) ||
+	    ((rv = nni_aio_alloc(&sc->txdataio, http_sconn_txdatdone, sc)) !=
 	        0) ||
-	    ((rv = nni_aio_init(&sc->cbaio, http_sconn_cbdone, sc)) != 0)) {
+	    ((rv = nni_aio_alloc(&sc->cbaio, http_sconn_cbdone, sc)) != 0)) {
 		// Can't even accept the incoming request.  Hard close.
 		http_sconn_close(sc);
 		return (rv);
@@ -821,7 +832,6 @@ http_server_fini(nni_http_server *s)
 	nng_stream_listener_free(s->listener);
 	while ((h = nni_list_first(&s->handlers)) != NULL) {
 		nni_list_remove(&s->handlers, h);
-		h->refcnt--;
 		nni_http_handler_fini(h);
 	}
 	nni_mtx_unlock(&s->mtx);
@@ -834,7 +844,7 @@ http_server_fini(nni_http_server *s)
 	nni_mtx_unlock(&s->errors_mtx);
 	nni_mtx_fini(&s->errors_mtx);
 
-	nni_aio_fini(s->accaio);
+	nni_aio_free(s->accaio);
 	nni_mtx_fini(&s->mtx);
 	nni_strfree(s->hostname);
 	NNI_FREE_STRUCT(s);
@@ -870,7 +880,7 @@ http_server_init(nni_http_server **serverp, const nni_url *url)
 	nni_mtx_init(&s->errors_mtx);
 	NNI_LIST_INIT(&s->errors, http_error, node);
 
-	if ((rv = nni_aio_init(&s->accaio, http_server_acccb, s)) != 0) {
+	if ((rv = nni_aio_alloc(&s->accaio, http_server_acccb, s)) != 0) {
 		http_server_fini(s);
 		return (rv);
 	}
@@ -1161,8 +1171,14 @@ nni_http_server_add_handler(nni_http_server *s, nni_http_handler *h)
 			return (NNG_EADDRINUSE);
 		}
 	}
-	h->refcnt = 1;
 	nni_list_append(&s->handlers, h);
+
+	// Note that we have borrowed the reference count on the handler.
+	// Thus we own it, and if the server is destroyed while we have it,
+	// then we must finalize it it too.  We do mark it busy so
+	// that other settings cannot change.
+	nni_atomic_set_bool(&h->busy, true);
+
 	nni_mtx_unlock(&s->mtx);
 	return (0);
 }
@@ -1175,13 +1191,15 @@ nni_http_server_del_handler(nni_http_server *s, nni_http_handler *h)
 	nni_mtx_lock(&s->mtx);
 	NNI_LIST_FOREACH (&s->handlers, srch) {
 		if (srch == h) {
+			// NB: We are giving the caller our reference
+			// on the handler.
 			nni_list_remove(&s->handlers, h);
-			h->refcnt--;
 			rv = 0;
 			break;
 		}
 	}
 	nni_mtx_unlock(&s->mtx);
+
 	return (rv);
 }
 

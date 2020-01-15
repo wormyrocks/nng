@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 //
 // This software is supplied under the terms of the MIT License, a
@@ -309,7 +309,7 @@ static void
 loadfile(const char *path, void **datap, size_t *lenp)
 {
 	FILE * f;
-	char * data;
+	char * fdata;
 	size_t len;
 
 	if ((f = fopen(path, "rb")) == NULL) {
@@ -320,17 +320,16 @@ loadfile(const char *path, void **datap, size_t *lenp)
 	}
 	len = ftell(f);
 	(void) fseek(f, 0, SEEK_SET);
-	if ((data = malloc(len + 1)) == NULL) {
+	if ((fdata = malloc(len + 1)) == NULL) {
 		fatal("Out of memory.");
 	}
-	data[len] = '\0';
-	size_t out = fread(data, 1, len, f);
+	fdata[len] = '\0';
 
-	if (out != len) {
-		fatal("Read file %s failed: %s, expected %d bytes, got %d bytes", path, strerror(errno), len, out);
+	if (fread(fdata, 1, len, f) != len) {
+		fatal("Read file %s failed: %s", path, strerror(errno));
 	}
 	fclose(f);
-	*datap = data;
+	*datap = fdata;
 	*lenp  = len;
 }
 
@@ -861,6 +860,8 @@ main(int ac, char **av)
 	case NNG_ENOARG:
 		fatal("Option %s requires argument.", av[idx]);
 		break;
+	default:
+	        break;
 	}
 
 	if (addrs == NULL) {
@@ -890,7 +891,7 @@ main(int ac, char **av)
 	}
 	if (proto == OPT_SUB0) {
 		if (topics == NULL) {
-			topicend = addtopic(topicend, ""); // subscribe to all
+			(void) addtopic(topicend, ""); // subscribe to all
 		}
 	} else {
 		if (topics != NULL) {
@@ -941,6 +942,9 @@ main(int ac, char **av)
 			      "--file or --data.");
 		}
 		break;
+	default:
+	        // Will be caught in next switch statement.
+	        break;
 	}
 
 	switch (proto) {

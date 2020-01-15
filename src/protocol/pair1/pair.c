@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2020 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 //
 // This software is supplied under the terms of the MIT License, a
@@ -9,10 +9,8 @@
 //
 
 #include <stdlib.h>
-#include <string.h>
 
 #include "core/nng_impl.h"
-
 #include "nng/protocol/pair1/pair.h"
 
 // Pair protocol.  The PAIRv1 protocol is a simple 1:1 messaging pattern,
@@ -23,7 +21,7 @@
 #define NNI_PROTO_PAIR_V1 NNI_PROTO(1, 1)
 #endif
 
-#define BUMPSTAT(x) nni_stat_inc_atomic(x, 1)
+#define BUMP_STAT(x) nni_stat_inc_atomic(x, 1)
 
 typedef struct pair1_pipe pair1_pipe;
 typedef struct pair1_sock pair1_sock;
@@ -71,24 +69,18 @@ pair1_sock_fini(void *arg)
 {
 	pair1_sock *s = arg;
 
-	nni_aio_fini(s->aio_getq);
+	nni_aio_free(s->aio_getq);
 	nni_idhash_fini(s->pipes);
 	nni_mtx_fini(&s->mtx);
-
-	NNI_FREE_STRUCT(s);
 }
 
 static int
-pair1_sock_init_impl(void **sp, nni_sock *nsock, bool raw)
+pair1_sock_init_impl(void *arg, nni_sock *nsock, bool raw)
 {
-	pair1_sock *s;
+	pair1_sock *s = arg;
 	int         rv;
 
-	if ((s = NNI_ALLOC_STRUCT(s)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	if ((rv = nni_idhash_init(&s->pipes)) != 0) {
-		NNI_FREE_STRUCT(s);
+	if (nni_idhash_init(&s->pipes) != 0) {
 		return (NNG_ENOMEM);
 	}
 	NNI_LIST_INIT(&s->plist, pair1_pipe, node);
@@ -96,7 +88,7 @@ pair1_sock_init_impl(void **sp, nni_sock *nsock, bool raw)
 	// Raw mode uses this.
 	nni_mtx_init(&s->mtx);
 
-	if ((rv = nni_aio_init(&s->aio_getq, pair1_sock_getq_cb, s)) != 0) {
+	if ((rv = nni_aio_alloc(&s->aio_getq, pair1_sock_getq_cb, s)) != 0) {
 		pair1_sock_fini(s);
 		return (rv);
 	}
@@ -123,21 +115,20 @@ pair1_sock_init_impl(void **sp, nni_sock *nsock, bool raw)
 	s->uwq   = nni_sock_sendq(nsock);
 	s->urq   = nni_sock_recvq(nsock);
 	s->ttl   = 8;
-	*sp      = s;
 
 	return (0);
 }
 
 static int
-pair1_sock_init(void **sp, nni_sock *nsock)
+pair1_sock_init(void *arg, nni_sock *nsock)
 {
-	return (pair1_sock_init_impl(sp, nsock, false));
+	return (pair1_sock_init_impl(arg, nsock, false));
 }
 
 static int
-pair1_sock_init_raw(void **sp, nni_sock *nsock)
+pair1_sock_init_raw(void *arg, nni_sock *nsock)
 {
-	return (pair1_sock_init_impl(sp, nsock, true));
+	return (pair1_sock_init_impl(arg, nsock, true));
 }
 
 static void
@@ -156,35 +147,30 @@ pair1_pipe_fini(void *arg)
 {
 	pair1_pipe *p = arg;
 
-	nni_aio_fini(p->aio_send);
-	nni_aio_fini(p->aio_recv);
-	nni_aio_fini(p->aio_putq);
-	nni_aio_fini(p->aio_getq);
+	nni_aio_free(p->aio_send);
+	nni_aio_free(p->aio_recv);
+	nni_aio_free(p->aio_putq);
+	nni_aio_free(p->aio_getq);
 	nni_msgq_fini(p->sendq);
-	NNI_FREE_STRUCT(p);
 }
 
 static int
-pair1_pipe_init(void **pp, nni_pipe *npipe, void *psock)
+pair1_pipe_init(void *arg, nni_pipe *npipe, void *psock)
 {
-	pair1_pipe *p;
+	pair1_pipe *p = arg;
 	int         rv;
 
-	if ((p = NNI_ALLOC_STRUCT(p)) == NULL) {
-		return (NNG_ENOMEM);
-	}
 	if (((rv = nni_msgq_init(&p->sendq, 2)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_send, pair1_pipe_send_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_recv, pair1_pipe_recv_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_getq, pair1_pipe_getq_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_putq, pair1_pipe_putq_cb, p)) != 0)) {
+	    ((rv = nni_aio_alloc(&p->aio_send, pair1_pipe_send_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_recv, pair1_pipe_recv_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_getq, pair1_pipe_getq_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_putq, pair1_pipe_putq_cb, p)) != 0)) {
 		pair1_pipe_fini(p);
 		return (NNG_ENOMEM);
 	}
 
 	p->npipe = npipe;
 	p->psock = psock;
-	*pp      = p;
 
 	return (rv);
 }
@@ -200,7 +186,7 @@ pair1_pipe_start(void *arg)
 	nni_mtx_lock(&s->mtx);
 	if (nni_pipe_peer(p->npipe) != NNI_PROTO_PAIR_V1) {
 		nni_mtx_unlock(&s->mtx);
-		BUMPSTAT(&s->stat_rejmismatch);
+		BUMP_STAT(&s->stat_rejmismatch);
 		// Peer protocol mismatch.
 		return (NNG_EPROTO);
 	}
@@ -214,7 +200,7 @@ pair1_pipe_start(void *arg)
 		if (!nni_list_empty(&s->plist)) {
 			nni_idhash_remove(s->pipes, id);
 			nni_mtx_unlock(&s->mtx);
-			BUMPSTAT(&s->stat_rejinuse);
+			BUMP_STAT(&s->stat_rejinuse);
 			return (NNG_EBUSY);
 		}
 	} else {
@@ -227,7 +213,7 @@ pair1_pipe_start(void *arg)
 	nni_mtx_unlock(&s->mtx);
 
 	// Schedule a getq.  In polyamorous mode we get on the per pipe
-	// sendq, as the socket distributes to us. In monogamous mode
+	// send_queue, as the socket distributes to us. In monogamous mode
 	// we bypass and get from the upper writeq directly (saving a
 	// set of context switches).
 	if (s->poly) {
@@ -268,7 +254,6 @@ pair1_pipe_recv_cb(void *arg)
 	nni_msg *   msg;
 	uint32_t    hdr;
 	nni_pipe *  npipe = p->npipe;
-	int         rv;
 	size_t      len;
 
 	if (nni_aio_result(p->aio_recv) != 0) {
@@ -306,7 +291,7 @@ pair1_pipe_recv_cb(void *arg)
 	}
 
 	// Store the hop count in the header.
-	if ((rv = nni_msg_header_append_u32(msg, hdr)) != 0) {
+	if (nni_msg_header_append_u32(msg, hdr) != 0) {
 		// STAT: bump allocfail
 		nni_msg_free(msg);
 		nni_pipe_recv(npipe, p->aio_recv);
@@ -358,7 +343,7 @@ pair1_sock_getq_cb(void *arg)
 	// Try a non-blocking send.  If this fails we just discard the
 	// message.  We have to do this to avoid head-of-line blocking
 	// for messages sent to other pipes.  Note that there is some
-	// buffering in the sendq.
+	// buffering in the send_queue.
 	if (nni_msgq_tryput(p->sendq, msg) != 0) {
 		nni_msg_free(msg);
 	}
@@ -441,7 +426,7 @@ pair1_pipe_send_cb(void *arg)
 		return;
 	}
 
-	// In polyamorous mode, we want to get from the sendq; in
+	// In polyamorous mode, we want to get from the send_queue; in
 	// monogamous we get from upper writeq.
 	nni_msgq_aio_get(s->poly ? p->sendq : s->uwq, p->aio_getq);
 }
@@ -514,6 +499,7 @@ pair1_sock_recv(void *arg, nni_aio *aio)
 }
 
 static nni_proto_pipe_ops pair1_pipe_ops = {
+	.pipe_size  = sizeof(pair1_pipe),
 	.pipe_init  = pair1_pipe_init,
 	.pipe_fini  = pair1_pipe_fini,
 	.pipe_start = pair1_pipe_start,
@@ -539,6 +525,7 @@ static nni_option pair1_sock_options[] = {
 };
 
 static nni_proto_sock_ops pair1_sock_ops = {
+	.sock_size    = sizeof(pair1_sock),
 	.sock_init    = pair1_sock_init,
 	.sock_fini    = pair1_sock_fini,
 	.sock_open    = pair1_sock_open,
@@ -564,6 +551,7 @@ nng_pair1_open(nng_socket *sidp)
 }
 
 static nni_proto_sock_ops pair1_sock_ops_raw = {
+	.sock_size    = sizeof(pair1_sock),
 	.sock_init    = pair1_sock_init_raw,
 	.sock_fini    = pair1_sock_fini,
 	.sock_open    = pair1_sock_open,

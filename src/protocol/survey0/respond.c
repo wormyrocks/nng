@@ -1,5 +1,5 @@
 //
-// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2020 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 //
 // This software is supplied under the terms of the MIT License, a
@@ -36,27 +36,26 @@ static void resp0_pipe_fini(void *);
 
 struct resp0_ctx {
 	resp0_sock *  sock;
-	char *        btrace;
-	size_t        btrace_len;
-	size_t        btrace_size;
 	uint32_t      pipe_id;
 	resp0_pipe *  spipe; // send pipe
 	nni_aio *     saio;  // send aio
 	nni_aio *     raio;  // recv aio
 	nni_list_node sqnode;
 	nni_list_node rqnode;
+	size_t        btrace_len;
+	uint32_t      btrace[256];
 };
 
 // resp0_sock is our per-socket protocol private structure.
 struct resp0_sock {
-	nni_mtx       mtx;
-	int           ttl;
-	nni_idhash *  pipes;
-	resp0_ctx *   ctx;
-	nni_list      recvpipes;
-	nni_list      recvq;
-	nni_pollable *recvable;
-	nni_pollable *sendable;
+	nni_mtx      mtx;
+	int          ttl;
+	nni_idhash * pipes;
+	resp0_ctx    ctx;
+	nni_list     recvpipes;
+	nni_list     recvq;
+	nni_pollable readable;
+	nni_pollable writable;
 };
 
 // resp0_pipe is our per-pipe protocol private structure.
@@ -102,32 +101,19 @@ resp0_ctx_fini(void *arg)
 	resp0_ctx *ctx = arg;
 
 	resp0_ctx_close(ctx);
-	nni_free(ctx->btrace, ctx->btrace_size);
-	NNI_FREE_STRUCT(ctx);
 }
 
 static int
-resp0_ctx_init(void **ctxp, void *sarg)
+resp0_ctx_init(void *carg, void *sarg)
 {
-	resp0_sock *s = sarg;
-	resp0_ctx * ctx;
+	resp0_sock *s   = sarg;
+	resp0_ctx * ctx = carg;
 
-	if ((ctx = NNI_ALLOC_STRUCT(ctx)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-
-	// this is 1kB, which covers the worst case.
-	ctx->btrace_size = 256 * sizeof(uint32_t);
-	if ((ctx->btrace = nni_alloc(ctx->btrace_size)) == NULL) {
-		NNI_FREE_STRUCT(ctx);
-		return (NNG_ENOMEM);
-	}
 	NNI_LIST_NODE_INIT(&ctx->sqnode);
 	NNI_LIST_NODE_INIT(&ctx->rqnode);
 	ctx->btrace_len = 0;
 	ctx->sock       = s;
 	ctx->pipe_id    = 0;
-	*ctxp           = ctx;
 
 	return (0);
 }
@@ -167,9 +153,9 @@ resp0_ctx_send(void *arg, nni_aio *aio)
 	msg = nni_aio_get_msg(aio);
 	nni_msg_header_clear(msg);
 
-	if (ctx == s->ctx) {
+	if (ctx == &s->ctx) {
 		// We can't send anymore, because only one send per request.
-		nni_pollable_clear(s->sendable);
+		nni_pollable_clear(&s->writable);
 	}
 
 	nni_mtx_lock(&s->mtx);
@@ -228,26 +214,20 @@ resp0_sock_fini(void *arg)
 	resp0_sock *s = arg;
 
 	nni_idhash_fini(s->pipes);
-	if (s->ctx != NULL) {
-		resp0_ctx_fini(s->ctx);
-	}
-	nni_pollable_free(s->sendable);
-	nni_pollable_free(s->recvable);
+	resp0_ctx_fini(&s->ctx);
+	nni_pollable_fini(&s->writable);
+	nni_pollable_fini(&s->readable);
 	nni_mtx_fini(&s->mtx);
-	NNI_FREE_STRUCT(s);
 }
 
 static int
-resp0_sock_init(void **sp, nni_sock *nsock)
+resp0_sock_init(void *arg, nni_sock *nsock)
 {
-	resp0_sock *s;
+	resp0_sock *s = arg;
 	int         rv;
 
 	NNI_ARG_UNUSED(nsock);
 
-	if ((s = NNI_ALLOC_STRUCT(s)) == NULL) {
-		return (NNG_ENOMEM);
-	}
 	nni_mtx_init(&s->mtx);
 	if ((rv = nni_idhash_init(&s->pipes)) != 0) {
 		resp0_sock_fini(s);
@@ -259,19 +239,12 @@ resp0_sock_init(void **sp, nni_sock *nsock)
 
 	s->ttl = 8; // Per RFC
 
-	if ((rv = resp0_ctx_init((void **) &s->ctx, s)) != 0) {
-		resp0_ctx_fini(s);
-		return (rv);
-	}
+	(void) resp0_ctx_init(&s->ctx, s);
 
-	// We start off without being either readable or pollable.
+	// We start off without being either readable or writable.
 	// Readability comes when there is something on the socket.
-	if (((rv = nni_pollable_alloc(&s->sendable)) != 0) ||
-	    ((rv = nni_pollable_alloc(&s->recvable)) != 0)) {
-		resp0_sock_fini(s);
-		return (rv);
-	}
-	*sp = s;
+	nni_pollable_init(&s->writable);
+	nni_pollable_init(&s->readable);
 	return (0);
 }
 
@@ -286,7 +259,7 @@ resp0_sock_close(void *arg)
 {
 	resp0_sock *s = arg;
 
-	resp0_ctx_close(s->ctx);
+	resp0_ctx_close(&s->ctx);
 }
 
 static void
@@ -308,22 +281,18 @@ resp0_pipe_fini(void *arg)
 		nni_aio_set_msg(p->aio_recv, NULL);
 		nni_msg_free(msg);
 	}
-	nni_aio_fini(p->aio_send);
-	nni_aio_fini(p->aio_recv);
-	NNI_FREE_STRUCT(p);
+	nni_aio_free(p->aio_send);
+	nni_aio_free(p->aio_recv);
 }
 
 static int
-resp0_pipe_init(void **pp, nni_pipe *npipe, void *s)
+resp0_pipe_init(void *arg, nni_pipe *npipe, void *s)
 {
-	resp0_pipe *p;
+	resp0_pipe *p = arg;
 	int         rv;
 
-	if ((p = NNI_ALLOC_STRUCT(p)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	if (((rv = nni_aio_init(&p->aio_recv, resp0_pipe_recv_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_send, resp0_pipe_send_cb, p)) != 0)) {
+	if (((rv = nni_aio_alloc(&p->aio_recv, resp0_pipe_recv_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_send, resp0_pipe_send_cb, p)) != 0)) {
 		resp0_pipe_fini(p);
 		return (rv);
 	}
@@ -335,7 +304,6 @@ resp0_pipe_init(void **pp, nni_pipe *npipe, void *s)
 	p->busy  = false;
 	p->id    = nni_pipe_id(npipe);
 
-	*pp = p;
 	return (0);
 }
 
@@ -383,10 +351,10 @@ resp0_pipe_close(void *arg)
 		nni_aio_finish(aio, 0, nni_msg_len(msg));
 		nni_msg_free(msg);
 	}
-	if (p->id == s->ctx->pipe_id) {
+	if (p->id == s->ctx.pipe_id) {
 		// Make sure user space knows they can send a message to us,
 		// which we will happily discard.
-		nni_pollable_raise(s->sendable);
+		nni_pollable_raise(&s->writable);
 	}
 	nni_idhash_remove(s->pipes, p->id);
 	nni_mtx_unlock(&s->mtx);
@@ -412,9 +380,9 @@ resp0_pipe_send_cb(void *arg)
 	p->busy = false;
 	if ((ctx = nni_list_first(&p->sendq)) == NULL) {
 		// Nothing else to send.
-		if (p->id == s->ctx->pipe_id) {
+		if (p->id == s->ctx.pipe_id) {
 			// Mark us ready for the other side to send!
-			nni_pollable_raise(s->sendable);
+			nni_pollable_raise(&s->writable);
 		}
 		nni_mtx_unlock(&s->mtx);
 		return;
@@ -488,7 +456,7 @@ resp0_ctx_recv(void *arg, nni_aio *aio)
 	nni_aio_set_msg(p->aio_recv, NULL);
 	nni_list_remove(&s->recvpipes, p);
 	if (nni_list_empty(&s->recvpipes)) {
-		nni_pollable_clear(s->recvable);
+		nni_pollable_clear(&s->readable);
 	}
 	nni_pipe_recv(p->npipe, p->aio_recv);
 
@@ -496,8 +464,8 @@ resp0_ctx_recv(void *arg, nni_aio *aio)
 	memcpy(ctx->btrace, nni_msg_header(msg), len);
 	ctx->btrace_len = len;
 	ctx->pipe_id    = p->id;
-	if (ctx == s->ctx) {
-		nni_pollable_raise(s->sendable);
+	if (ctx == &s->ctx) {
+		nni_pollable_raise(&s->writable);
 	}
 	nni_mtx_unlock(&s->mtx);
 
@@ -543,7 +511,7 @@ resp0_pipe_recv_cb(void *arg)
 			return;
 		}
 		body = nni_msg_body(msg);
-		end  = ((body[0] & 0x80) != 0);
+		end  = ((body[0] & 0x80u) != 0);
 		if (nni_msg_header_append(msg, body, 4) != 0) {
 			goto drop;
 		}
@@ -559,7 +527,7 @@ resp0_pipe_recv_cb(void *arg)
 	if ((ctx = nni_list_first(&s->recvq)) == NULL) {
 		// No one blocked in recv, stall.
 		nni_list_append(&s->recvpipes, p);
-		nni_pollable_raise(s->recvable);
+		nni_pollable_raise(&s->readable);
 		nni_mtx_unlock(&s->mtx);
 		return;
 	}
@@ -577,8 +545,8 @@ resp0_pipe_recv_cb(void *arg)
 	nni_msg_header_clear(msg);
 	ctx->pipe_id = p->id;
 
-	if ((ctx == s->ctx) && (!p->busy)) {
-		nni_pollable_raise(s->sendable);
+	if ((ctx == &s->ctx) && (!p->busy)) {
+		nni_pollable_raise(&s->writable);
 	}
 	nni_mtx_unlock(&s->mtx);
 
@@ -613,7 +581,7 @@ resp0_sock_get_sendfd(void *arg, void *buf, size_t *szp, nni_opt_type t)
 	int         rv;
 	int         fd;
 
-	if ((rv = nni_pollable_getfd(s->sendable, &fd)) != 0) {
+	if ((rv = nni_pollable_getfd(&s->writable, &fd)) != 0) {
 		return (rv);
 	}
 	return (nni_copyout_int(fd, buf, szp, t));
@@ -626,7 +594,7 @@ resp0_sock_get_recvfd(void *arg, void *buf, size_t *szp, nni_opt_type t)
 	int         rv;
 	int         fd;
 
-	if ((rv = nni_pollable_getfd(s->recvable, &fd)) != 0) {
+	if ((rv = nni_pollable_getfd(&s->readable, &fd)) != 0) {
 		return (rv);
 	}
 	return (nni_copyout_int(fd, buf, szp, t));
@@ -637,7 +605,7 @@ resp0_sock_send(void *arg, nni_aio *aio)
 {
 	resp0_sock *s = arg;
 
-	resp0_ctx_send(s->ctx, aio);
+	resp0_ctx_send(&s->ctx, aio);
 }
 
 static void
@@ -645,10 +613,11 @@ resp0_sock_recv(void *arg, nni_aio *aio)
 {
 	resp0_sock *s = arg;
 
-	resp0_ctx_recv(s->ctx, aio);
+	resp0_ctx_recv(&s->ctx, aio);
 }
 
 static nni_proto_pipe_ops resp0_pipe_ops = {
+	.pipe_size  = sizeof(resp0_pipe),
 	.pipe_init  = resp0_pipe_init,
 	.pipe_fini  = resp0_pipe_fini,
 	.pipe_start = resp0_pipe_start,
@@ -657,6 +626,7 @@ static nni_proto_pipe_ops resp0_pipe_ops = {
 };
 
 static nni_proto_ctx_ops resp0_ctx_ops = {
+	.ctx_size = sizeof(resp0_ctx),
 	.ctx_init = resp0_ctx_init,
 	.ctx_fini = resp0_ctx_fini,
 	.ctx_send = resp0_ctx_send,
@@ -686,6 +656,7 @@ static nni_option resp0_sock_options[] = {
 };
 
 static nni_proto_sock_ops resp0_sock_ops = {
+	.sock_size    = sizeof(resp0_sock),
 	.sock_init    = resp0_sock_init,
 	.sock_fini    = resp0_sock_fini,
 	.sock_open    = resp0_sock_open,

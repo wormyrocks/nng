@@ -1,5 +1,5 @@
 //
-// Copyright 2018 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2020 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 //
 // This software is supplied under the terms of the MIT License, a
@@ -53,18 +53,14 @@ struct pair0_pipe {
 };
 
 static int
-pair0_sock_init(void **sp, nni_sock *nsock)
+pair0_sock_init(void *arg, nni_sock *nsock)
 {
-	pair0_sock *s;
+	pair0_sock *s = arg;
 
-	if ((s = NNI_ALLOC_STRUCT(s)) == NULL) {
-		return (NNG_ENOMEM);
-	}
 	nni_mtx_init(&s->mtx);
 	s->ppipe = NULL;
 	s->uwq   = nni_sock_sendq(nsock);
 	s->urq   = nni_sock_recvq(nsock);
-	*sp      = s;
 	return (0);
 }
 
@@ -74,7 +70,6 @@ pair0_sock_fini(void *arg)
 	pair0_sock *s = arg;
 
 	nni_mtx_fini(&s->mtx);
-	NNI_FREE_STRUCT(s);
 }
 
 static void
@@ -93,33 +88,28 @@ pair0_pipe_fini(void *arg)
 {
 	pair0_pipe *p = arg;
 
-	nni_aio_fini(p->aio_send);
-	nni_aio_fini(p->aio_recv);
-	nni_aio_fini(p->aio_putq);
-	nni_aio_fini(p->aio_getq);
-	NNI_FREE_STRUCT(p);
+	nni_aio_free(p->aio_send);
+	nni_aio_free(p->aio_recv);
+	nni_aio_free(p->aio_putq);
+	nni_aio_free(p->aio_getq);
 }
 
 static int
-pair0_pipe_init(void **pp, nni_pipe *npipe, void *psock)
+pair0_pipe_init(void *arg, nni_pipe *npipe, void *psock)
 {
-	pair0_pipe *p;
+	pair0_pipe *p = arg;
 	int         rv;
 
-	if ((p = NNI_ALLOC_STRUCT(p)) == NULL) {
-		return (NNG_ENOMEM);
-	}
-	if (((rv = nni_aio_init(&p->aio_send, pair0_send_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_recv, pair0_recv_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_getq, pair0_getq_cb, p)) != 0) ||
-	    ((rv = nni_aio_init(&p->aio_putq, pair0_putq_cb, p)) != 0)) {
+	if (((rv = nni_aio_alloc(&p->aio_send, pair0_send_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_recv, pair0_recv_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_getq, pair0_getq_cb, p)) != 0) ||
+	    ((rv = nni_aio_alloc(&p->aio_putq, pair0_putq_cb, p)) != 0)) {
 		pair0_pipe_fini(p);
 		return (rv);
 	}
 
 	p->npipe = npipe;
 	p->psock = psock;
-	*pp      = p;
 	return (0);
 }
 
@@ -262,6 +252,7 @@ pair0_sock_recv(void *arg, nni_aio *aio)
 }
 
 static nni_proto_pipe_ops pair0_pipe_ops = {
+	.pipe_size  = sizeof(pair0_pipe),
 	.pipe_init  = pair0_pipe_init,
 	.pipe_fini  = pair0_pipe_fini,
 	.pipe_start = pair0_pipe_start,
@@ -277,6 +268,7 @@ static nni_option pair0_sock_options[] = {
 };
 
 static nni_proto_sock_ops pair0_sock_ops = {
+	.sock_size    = sizeof(pair0_sock),
 	.sock_init    = pair0_sock_init,
 	.sock_fini    = pair0_sock_fini,
 	.sock_open    = pair0_sock_open,
