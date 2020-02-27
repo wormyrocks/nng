@@ -37,12 +37,12 @@ static void xresp0_pipe_fini(void *);
 
 // resp0_sock is our per-socket protocol private structure.
 struct xresp0_sock {
-	nni_msgq *  urq;
-	nni_msgq *  uwq;
-	int         ttl;
-	nni_idhash *pipes;
-	nni_aio *   aio_getq;
-	nni_mtx     mtx;
+	nni_msgq *     urq;
+	nni_msgq *     uwq;
+	nni_atomic_int ttl;
+	nni_idhash *   pipes;
+	nni_aio *      aio_getq;
+	nni_mtx        mtx;
 };
 
 // resp0_pipe is our per-pipe protocol private structure.
@@ -74,13 +74,15 @@ xresp0_sock_init(void *arg, nni_sock *nsock)
 	int          rv;
 
 	nni_mtx_init(&s->mtx);
+	nni_atomic_init(&s->ttl);
+	nni_atomic_set(&s->ttl, 8); // Per RFC
 	if (((rv = nni_idhash_init(&s->pipes)) != 0) ||
-	    ((rv = nni_aio_alloc(&s->aio_getq, xresp0_sock_getq_cb, s)) != 0)) {
+	    ((rv = nni_aio_alloc(&s->aio_getq, xresp0_sock_getq_cb, s)) !=
+	        0)) {
 		xresp0_sock_fini(s);
 		return (rv);
 	}
 
-	s->ttl = 8; // Per RFC
 	s->urq = nni_sock_recvq(nsock);
 	s->uwq = nni_sock_sendq(nsock);
 
@@ -269,20 +271,20 @@ xresp0_recv_cb(void *arg)
 	nni_msgq *   urq = s->urq;
 	nni_msg *    msg;
 	int          hops;
+	int          ttl;
 
 	if (nni_aio_result(p->aio_recv) != 0) {
 		nni_pipe_close(p->npipe);
 		return;
 	}
 
+	ttl = nni_atomic_get(&s->ttl);
 	msg = nni_aio_get_msg(p->aio_recv);
 	nni_aio_set_msg(p->aio_recv, NULL);
 	nni_msg_set_pipe(msg, p->id);
 
 	// Store the pipe id in the header, first thing.
-	if (nni_msg_header_append_u32(msg, p->id) != 0) {
-		goto drop;
-	}
+	nni_msg_header_append_u32(msg, p->id);
 
 	// Move backtrace from body to header
 	hops = 1;
@@ -290,7 +292,7 @@ xresp0_recv_cb(void *arg)
 		bool     end;
 		uint8_t *body;
 
-		if (hops > s->ttl) {
+		if (hops > ttl) {
 			goto drop;
 		}
 		hops++;
@@ -340,14 +342,19 @@ static int
 xresp0_sock_set_maxttl(void *arg, const void *buf, size_t sz, nni_opt_type t)
 {
 	xresp0_sock *s = arg;
-	return (nni_copyin_int(&s->ttl, buf, sz, 1, 255, t));
+	int ttl;
+	int rv;
+	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, NNI_MAX_MAX_TTL, t)) == 0) {
+		nni_atomic_set(&s->ttl, ttl);
+	}
+	return (rv);
 }
 
 static int
 xresp0_sock_get_maxttl(void *arg, void *buf, size_t *szp, nni_opt_type t)
 {
 	xresp0_sock *s = arg;
-	return (nni_copyout_int(s->ttl, buf, szp, t));
+	return (nni_copyout_int(nni_atomic_get(&s->ttl), buf, szp, t));
 }
 
 static void

@@ -17,14 +17,6 @@
 // request-reply pair.  This is useful for building RPC servers, for
 // example.
 
-#ifndef NNI_PROTO_REQ_V0
-#define NNI_PROTO_REQ_V0 NNI_PROTO(3, 0)
-#endif
-
-#ifndef NNI_PROTO_REP_V0
-#define NNI_PROTO_REP_V0 NNI_PROTO(3, 1)
-#endif
-
 typedef struct xrep0_pipe xrep0_pipe;
 typedef struct xrep0_sock xrep0_sock;
 
@@ -167,7 +159,7 @@ xrep0_pipe_start(void *arg)
 	xrep0_sock *s = p->rep;
 	int         rv;
 
-	if (nni_pipe_peer(p->pipe) != NNI_PROTO_REQ_V0) {
+	if (nni_pipe_peer(p->pipe) != NNG_REP0_PEER) {
 		// Peer protocol mismatch.
 		return (NNG_EPROTO);
 	}
@@ -283,11 +275,14 @@ xrep0_pipe_recv_cb(void *arg)
 	xrep0_sock *s = p->rep;
 	nni_msg *   msg;
 	int         hops;
+	int         ttl;
 
 	if (nni_aio_result(&p->aio_recv) != 0) {
 		nni_pipe_close(p->pipe);
 		return;
 	}
+
+	ttl = nni_atomic_get(&s->ttl);
 
 	msg = nni_aio_get_msg(&p->aio_recv);
 	nni_aio_set_msg(&p->aio_recv, NULL);
@@ -295,14 +290,14 @@ xrep0_pipe_recv_cb(void *arg)
 	nni_msg_set_pipe(msg, nni_pipe_id(p->pipe));
 
 	// Store the pipe id in the header, first thing.
-	nni_msg_header_must_append_u32(msg, nni_pipe_id(p->pipe));
+	nni_msg_header_append_u32(msg, nni_pipe_id(p->pipe));
 
 	// Move backtrace from body to header
 	hops = 1;
 	for (;;) {
-		bool     end = 0;
+		bool     end;
 		uint8_t *body;
-		if (hops > (int)nni_atomic_get(&s->ttl)) {
+		if (hops > ttl) {
 			// This isn't malformed, but it has gone through
 			// too many hops.  Do not disconnect, because we
 			// can legitimately receive messages with too many
@@ -360,7 +355,7 @@ xrep0_sock_set_maxttl(void *arg, const void *buf, size_t sz, nni_opt_type t)
 	xrep0_sock *s = arg;
 	int         ttl;
 	int         rv;
-	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, 255, t)) == 0) {
+	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, NNI_MAX_MAX_TTL, t)) == 0) {
 		nni_atomic_set(&s->ttl, ttl);
 	}
 	return (rv);
@@ -425,8 +420,8 @@ static nni_proto_sock_ops xrep0_sock_ops = {
 
 static nni_proto xrep0_proto = {
 	.proto_version  = NNI_PROTOCOL_VERSION,
-	.proto_self     = { NNI_PROTO_REP_V0, "rep" },
-	.proto_peer     = { NNI_PROTO_REQ_V0, "req" },
+	.proto_self     = { NNG_REP0_SELF, NNG_REP0_SELF_NAME },
+	.proto_peer     = { NNG_REP0_PEER, NNG_REP0_PEER_NAME },
 	.proto_flags    = NNI_PROTO_FLAG_SNDRCV | NNI_PROTO_FLAG_RAW,
 	.proto_sock_ops = &xrep0_sock_ops,
 	.proto_pipe_ops = &xrep0_pipe_ops,

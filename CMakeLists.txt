@@ -25,7 +25,7 @@
 #   IN THE SOFTWARE.
 #
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.13)
 
 project(nng C)
 include(CheckFunctionExists)
@@ -45,6 +45,9 @@ if (POLICY CMP0042)
     # Newer cmake on MacOS should use @rpath
     cmake_policy(SET CMP0042 NEW)
 endif ()
+if (POLICY CMP0079)
+    cmake_policy(SET CMP0079 NEW)
+endif ()
 
 if (POLICY CMP0028)
     # Double colon targets are only alias or imports.
@@ -62,40 +65,22 @@ set(NNG_DESCRIPTION "High-Performance Scalability Protocols NextGen")
 set(ISSUE_REPORT_MSG "Please consider opening an issue at https://github.com/nanomsg/nng")
 
 # Determine library versions.
+file(READ "include/nng/nng.h" nng_ver_h)
+string(REGEX MATCH "NNG_MAJOR_VERSION ([0-9]*)" _ ${nng_ver_h})
+set(NNG_MAJOR_VERSION ${CMAKE_MATCH_1})
+string(REGEX MATCH "NNG_MINOR_VERSION ([0-9]*)" _ ${nng_ver_h})
+set(NNG_MINOR_VERSION ${CMAKE_MATCH_1})
+string(REGEX MATCH "NNG_PATCH_VERSION ([0-9]*)" _ ${nng_ver_h})
+set(NNG_PATCH_VERSION ${CMAKE_MATCH_1})
+string(REGEX MATCH "NNG_RELEASE_SUFFIX \"([a-z0-9]*)\"" _ ${nng_ver_h})
+if (NOT (${CMAKE_MATCH_1} STREQUAL ""))
+    set(NNG_PRERELEASE "-${CMAKE_MATCH_1}")
+endif ()
+
 set(NNG_ABI_SOVERSION 1)
-set(NNG_ABI_VERSION "1.3.0")
-
-# Determine package version.
-find_package(Git QUIET)
-if (GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
-    # Working off a git repo, using git versioning
-
-    # Get version from last tag
-    execute_process(
-            COMMAND "${GIT_EXECUTABLE}" describe --always# | sed -e "s:v::"
-            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
-            OUTPUT_VARIABLE NNG_PACKAGE_VERSION
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-    # If the sources have been changed locally, add -dirty to the version.
-    execute_process(
-            COMMAND "${GIT_EXECUTABLE}" diff --quiet
-            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
-            RESULT_VARIABLE res)
-    if (res EQUAL 1)
-        set(NNG_PACKAGE_VERSION "${NNG_PACKAGE_VERSION}-dirty")
-    endif ()
-
-else ()
-    set(NNG_PACKAGE_VERSION "Unknown")
-endif ()
-if ("${NNG_PACKAGE_VERSION}" MATCHES "v[0-9]")
-    string(SUBSTRING "${NNG_PACKAGE_VERSION}" 1 -1 NNG_PACKAGE_VERSION)
-endif ()
-
-string(REGEX REPLACE "([0-9]+).[0-9]+.+" "\\1" NNG_VERSION_MAJOR "${NNG_PACKAGE_VERSION}")
-string(REGEX REPLACE "[0-9]+.([0-9]+).[0-9].+" "\\1" NNG_VERSION_MINOR "${NNG_PACKAGE_VERSION}")
-string(REGEX REPLACE "[0-9]+.[0-9]+.([0-9]+).*" "\\1" NNG_VERSION_PATCH "${NNG_PACKAGE_VERSION}")
+set(NNG_ABI_VERSION "${NNG_MAJOR_VERSION}.${NNG_MINOR_VERSION}.${NNG_PATCH_VERSION}${NNG_PRERELEASE}")
+set(NNG_PACKAGE_VERSION "${NNG_ABI_VERSION}")
+message("Configuring for NNG version ${NNG_ABI_VERSION}")
 
 # User-defined options.
 
@@ -109,11 +94,14 @@ endif ()
 
 # We only build command line tools and tests if we are not in a
 # cross-compile situation.  Cross-compiling users who still want to
-# build these must enable them explicitly.
+# build these must enable them explicitly.  Some of these switches
+# must be enabled rather early as we use their values later.
 option(NNG_TESTS "Build and run tests" ${NNG_NATIVE_BUILD})
 option(NNG_TOOLS "Build extra tools" ${NNG_NATIVE_BUILD})
 option(NNG_ENABLE_NNGCAT "Enable building nngcat utility." ${NNG_TOOLS})
 option(NNG_ENABLE_COVERAGE "Enable coverage reporting." OFF)
+
+
 # Enable access to private APIs for our own use.
 add_definitions(-DNNG_PRIVATE)
 
@@ -121,19 +109,14 @@ add_definitions(-DNNG_PRIVATE)
 # that have too small defaults.  This is not used for Windows,
 # which can grow thread stacks sensibly.  (Note that NNG can get
 # by with a smallish stack, but application callbacks might require
-# larger values if using aio completion callbacks.)
+# larger values if using aio completion callbacks.  TLS libraries may
+# require larger stacks however.)
 if (NOT WIN32)
     option(NNG_SETSTACKSIZE "Use rlimit for thread stack size" OFF)
     if (NNG_SETSTACKSIZE)
         add_definitions(-DNNG_SETSTACKSIZE)
     endif ()
     mark_as_advanced(NNG_SETSTACKSIZE)
-endif ()
-
-option(NNG_ENABLE_TLS "Enable TLS protocol (requires mbedTLS)" OFF)
-if (NNG_ENABLE_TLS)
-    add_definitions(-DNNG_SUPP_TLS)
-    set(NNG_SUPP_TLS ON)
 endif ()
 
 option(NNG_ENABLE_STATS "Enable statistics" ON)
@@ -152,6 +135,12 @@ if (NNG_NUM_TASKQ_THREADS)
 endif ()
 mark_as_advanced(NNG_NUM_TASKQ_THREADS)
 
+set(NNG_MAX_TASKQ_THREADS 16 CACHE STRING "Upper bound on taskq threads, 0 for no limit")
+mark_as_advanced(NNG_MAX_TASKQ_THREADS)
+if (NNG_MAX_TASKQ_THREADS)
+    add_definitions(-DNNG_MAX_TASKQ_THREADS=${NNG_MAX_TASKQ_THREADS})
+endif ()
+
 #  Platform checks.
 
 if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -165,6 +154,13 @@ CheckSanitizer()
 if (NOT NNG_SANITIZER STREQUAL "none")
     set(NNG_SANITIZER_FLAGS "-fsanitize=${NNG_SANITIZER}")
 endif ()
+
+include(CheckAtomicLib)
+CheckAtomicLib()
+if (NOT HAVE_C_ATOMICS_WITHOUT_LIB AND HAVE_C_ATOMICS_WITH_LIB)
+    list(APPEND NNG_LIBS "atomic")
+endif ()
+
 
 if (NNG_ENABLE_COVERAGE)
     # NB: This only works for GCC and Clang 3.0 and newer.  If your stuff
@@ -369,9 +365,10 @@ endif ()
 if (NNG_TESTS)
     enable_testing()
     set(all_tests, "")
+endif ()
 
-
-    macro(nng_test NAME)
+macro(nng_test NAME)
+    if (NNG_TESTS)
         add_executable(${NAME} ${NAME}.c ${ARGN})
         target_link_libraries(${NAME} ${PROJECT_NAME}_testlib)
         target_include_directories(${NAME} PRIVATE
@@ -380,37 +377,30 @@ if (NNG_TESTS)
                 ${PROJECT_SOURCE_DIR}/include)
         add_test(NAME ${NAME} COMMAND ${NAME} -t)
         set_tests_properties(${NAME} PROPERTIES TIMEOUT 180)
-    endmacro()
+    endif ()
+endmacro()
 
-    function(nng_sources_testlib)
+function(nng_sources_testlib)
+    if (NNG_TESTS)
         foreach (f ${ARGN})
             target_sources(${PROJECT_NAME}_testlib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${f})
         endforeach ()
-    endfunction()
+    endif ()
+endfunction()
 
-    function(nng_headers_testlib)
+function(nng_headers_testlib)
+    if (NNG_TESTS)
         foreach (f ${ARGN})
             target_sources(${PROJECT_NAME}_testlib PRIVATE ${PROJECT_SOURCE_DIR}/include/${f})
         endforeach ()
-    endfunction()
+    endif ()
+endfunction()
 
-    function(nng_defines_testlib)
+function(nng_defines_testlib)
+    if (NNG_TESTS)
         target_compile_definitions(${PROJECT_NAME}_testlib PRIVATE ${ARGN})
-    endfunction()
-
-else ()
-    function(nng_test NAME)
-    endfunction()
-
-    function(nng_sources_testlib)
-    endfunction()
-
-    function(nng_headers_testlib)
-    endfunction()
-
-    function(nng_defines_testlib)
-    endfunction()
-endif ()
+    endif ()
+endfunction()
 
 function(nng_sources)
     foreach (f ${ARGN})
@@ -476,6 +466,12 @@ endif ()
 
 if (NNG_ENABLE_NNGCAT)
     add_subdirectory(tools/nngcat)
+endif ()
+
+option(NNG_ENABLE_TLS "Enable TLS protocol" OFF)
+if (NNG_ENABLE_TLS)
+    add_definitions(-DNNG_SUPP_TLS)
+    set(NNG_SUPP_TLS ON)
 endif ()
 
 add_subdirectory(docs/man)

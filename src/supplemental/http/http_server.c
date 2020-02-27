@@ -1,8 +1,9 @@
 //
-// Copyright 2019 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2020 Staysail Systems, Inc. <info@staysail.tech>
 // Copyright 2018 Capitar IT Group BV <info@capitar.com>
 // Copyright 2018 QXSoftware <lh563566994@126.com>
 // Copyright 2019 Devolutions <info@devolutions.net>
+// Copyright 2020 Dirac Research <robert.bielik@dirac.com>
 //
 // This software is supplied under the terms of the MIT License, a
 // copy of which should be located in the distribution where this
@@ -18,7 +19,6 @@
 
 #include "core/nng_impl.h"
 #include "nng/supplemental/tls/tls.h"
-#include "supplemental/tls/tls_api.h"
 
 #include "http_api.h"
 
@@ -37,6 +37,7 @@ struct nng_http_handler {
 	char *          method;
 	char *          host;
 	bool            tree;
+	bool            tree_exclusive;
 	nni_atomic_u64  ref;
 	nni_atomic_bool busy;
 	size_t          maxbody;
@@ -110,11 +111,12 @@ nni_http_handler_init(
 		return (NNG_ENOMEM);
 	}
 	NNI_LIST_NODE_INIT(&h->node);
-	h->cb      = cb;
-	h->data    = NULL;
-	h->dtor    = NULL;
-	h->host    = NULL;
-	h->tree    = false;
+	h->cb             = cb;
+	h->data           = NULL;
+	h->dtor           = NULL;
+	h->host           = NULL;
+	h->tree           = false;
+	h->tree_exclusive = false;
 	h->maxbody = 1024 * 1024; // By default we accept up to 1MB of body
 	h->getbody = true;
 	*hp        = h;
@@ -177,7 +179,19 @@ nni_http_handler_set_tree(nni_http_handler *h)
 	if (nni_atomic_get_bool(&h->busy) != 0) {
 		return (NNG_EBUSY);
 	}
-	h->tree = true;
+	h->tree           = true;
+	h->tree_exclusive = false;
+	return (0);
+}
+
+int
+nni_http_handler_set_tree_exclusive(nni_http_handler *h)
+{
+	if (nni_atomic_get_bool(&h->busy) != 0) {
+		return (NNG_EBUSY);
+	}
+	h->tree           = true;
+	h->tree_exclusive = true;
 	return (0);
 }
 
@@ -682,7 +696,7 @@ http_sconn_cbdone(void *arg)
 	// Get the handler.  It may be set regardless of success or
 	// failure.  Clear it, and drop our reference, since we're
 	// done with the handler for now.
-	h   = nni_aio_get_data(aio, 1);
+	h = nni_aio_get_data(aio, 1);
 	nni_aio_set_data(aio, 1, NULL);
 
 	if (h != NULL) {
@@ -1121,8 +1135,8 @@ nni_http_server_add_handler(nni_http_server *s, nni_http_handler *h)
 	}
 
 	nni_mtx_lock(&s->mtx);
-	// General rule for finding a conflict is that if either string
-	// is a strict substring of the other, then we have a
+	// General rule for finding a conflict is that if either uri
+	// string is an exact duplicate of the other, then we have a
 	// collision.  (But only if the methods match, and the host
 	// matches.)  Note that a wild card host matches both.
 	NNI_LIST_FOREACH (&s->handlers, h2) {
@@ -1152,26 +1166,54 @@ nni_http_server_add_handler(nni_http_server *s, nni_http_handler *h)
 		while ((len2 > 0) && (h2->uri[len2 - 1] == '/')) {
 			len2--; // ignore trailing '/'
 		}
-		if (strncmp(h->uri, h2->uri, len > len2 ? len2 : len) != 0) {
-			continue; // prefixes don't match.
-		}
 
-		if (len2 > len) {
-			if ((h2->uri[len] == '/') && (h->tree)) {
-				nni_mtx_unlock(&s->mtx);
-				return (NNG_EADDRINUSE);
+		if ((h2->tree && h2->tree_exclusive) ||
+		    (h->tree && h->tree_exclusive)) {
+			// Old behavior
+			if (strncmp(h->uri, h2->uri,
+			        len > len2 ? len2 : len) != 0) {
+				continue; // prefixes don't match.
 			}
-		} else if (len > len2) {
-			if ((h->uri[len2] == '/') && (h2->tree)) {
+
+			if (len2 > len) {
+				if ((h2->uri[len] == '/') && (h->tree)) {
+					nni_mtx_unlock(&s->mtx);
+					return (NNG_EADDRINUSE);
+				}
+			} else if (len > len2) {
+				if ((h->uri[len2] == '/') && (h2->tree)) {
+					nni_mtx_unlock(&s->mtx);
+					return (NNG_EADDRINUSE);
+				}
+			} else {
 				nni_mtx_unlock(&s->mtx);
 				return (NNG_EADDRINUSE);
 			}
 		} else {
+			if (len != len2) {
+				continue; // length mismatch
+			}
+
+			if (strcmp(h->uri, h2->uri) != 0) {
+				continue; // not a duplicate
+			}
+
 			nni_mtx_unlock(&s->mtx);
 			return (NNG_EADDRINUSE);
 		}
 	}
-	nni_list_append(&s->handlers, h);
+
+	// Maintain list of handlers in longest uri first order
+	NNI_LIST_FOREACH (&s->handlers, h2) {
+		size_t len2 = strlen(h2->uri);
+		if (len > len2) {
+			nni_list_insert_before(&s->handlers, h, h2);
+			break;
+		}
+	}
+	if (h2 == NULL) {
+		nni_list_append(&s->handlers, h);
+	}
 
 	// Note that we have borrowed the reference count on the handler.
 	// Thus we own it, and if the server is destroyed while we have it,
@@ -1408,14 +1450,15 @@ http_handle_dir(nni_aio *aio)
 	char *            pn;
 
 	len = strlen(base);
-	if ((strncmp(uri, base, len) != 0) ||
-	    ((uri[len] != 0) && (uri[len] != '/'))) {
+	if (base[1] != '\0' && // Allows "/" as base
+	    ((strncmp(uri, base, len) != 0) ||
+	        ((uri[len] != 0) && (uri[len] != '/')))) {
 		// This should never happen!
 		nni_aio_finish_error(aio, NNG_EINVAL);
 		return;
 	}
 
-	// simple worst case is every character in path is a seperator
+	// simple worst case is every character in path is a separator
 	// It's never actually that bad, because we we have /<something>/.
 	pnsz = (strlen(path) + strlen(uri) + 2) * strlen(NNG_PLATFORM_DIR_SEP);
 	pnsz += strlen("index.html") + 1; // +1 for term nul
@@ -1538,7 +1581,7 @@ nni_http_handler_init_directory(
 	// We don't permit a body for getting a file.
 	nni_http_handler_collect_body(h, true, 0);
 
-	if (((rv = nni_http_handler_set_tree(h)) != 0) ||
+	if (((rv = nni_http_handler_set_tree_exclusive(h)) != 0) ||
 	    ((rv = nni_http_handler_set_data(h, hf, http_file_free)) != 0)) {
 		http_file_free(hf);
 		nni_http_handler_fini(h);

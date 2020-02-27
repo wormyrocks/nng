@@ -7,7 +7,6 @@
 // file was obtained (LICENSE.txt).  A copy of the license may also be
 // found online at https://opensource.org/licenses/MIT.
 //
-
 #include <stdio.h>
 
 #include "core/nng_impl.h"
@@ -15,14 +14,6 @@
 
 // Request protocol.  The REQ protocol is the "request" side of a
 // request-reply pair.  This is useful for building RPC clients, for example.
-
-#ifndef NNI_PROTO_REQ_V0
-#define NNI_PROTO_REQ_V0 NNI_PROTO(3, 0)
-#endif
-
-#ifndef NNI_PROTO_REP_V0
-#define NNI_PROTO_REP_V0 NNI_PROTO(3, 1)
-#endif
 
 typedef struct req0_pipe req0_pipe;
 typedef struct req0_sock req0_sock;
@@ -46,7 +37,7 @@ struct req0_ctx {
 	uint32_t       request_id; // request ID, without high bit set
 	nni_aio *      recv_aio;   // user aio waiting to recv - only one!
 	nni_aio *      send_aio;   // user aio waiting to send
-	nng_msg *      req_msg;    // request message
+	nng_msg *      req_msg;    // request message (owned by protocol)
 	size_t         req_len;    // length of request message (for stats)
 	nng_msg *      rep_msg;    // reply message
 	nni_timer_node timer;
@@ -200,7 +191,7 @@ req0_pipe_start(void *arg)
 	req0_pipe *p = arg;
 	req0_sock *s = p->req;
 
-	if (nni_pipe_peer(p->pipe) != NNI_PROTO_REP_V0) {
+	if (nni_pipe_peer(p->pipe) != NNG_REQ0_PEER) {
 		return (NNG_EPROTO);
 	}
 
@@ -317,7 +308,6 @@ req0_recv_cb(void *arg)
 		goto malformed;
 	}
 	id = nni_msg_trim_u32(msg);
-	nni_msg_header_must_append_u32(msg, id);
 
 	// Schedule another receive while we are processing this.
 	nni_mtx_lock(&s->mtx);
@@ -446,7 +436,6 @@ req0_run_send_queue(req0_sock *s, nni_list *sent_list)
 
 	// Note: This routine should be called with the socket lock held.
 	while ((ctx = nni_list_first(&s->send_queue)) != NULL) {
-		nni_msg *  msg;
 		req0_pipe *p;
 
 		if ((p = nni_list_first(&s->ready_pipes)) == NULL) {
@@ -467,12 +456,6 @@ req0_run_send_queue(req0_sock *s, nni_list *sent_list)
 		if (ctx->retry > 0) {
 			nni_timer_schedule(
 			    &ctx->timer, nni_clock() + ctx->retry);
-		}
-
-		if (nni_msg_dup(&msg, ctx->req_msg) != 0) {
-			// Oops.  Well, keep trying each context; maybe
-			// one of them will get lucky.
-			continue;
 		}
 
 		// Put us on the pipe list of active contexts.
@@ -499,7 +482,11 @@ req0_run_send_queue(req0_sock *s, nni_list *sent_list)
 			}
 		}
 
-		nni_aio_set_msg(&p->aio_send, msg);
+		// At this point, we will never give this message back to
+		// to the user, so we don't have to worry about making it
+		// unique.  We can freely clone it.
+		nni_msg_clone(ctx->req_msg);
+		nni_aio_set_msg(&p->aio_send, ctx->req_msg);
 		nni_pipe_send(p->pipe, &p->aio_send);
 	}
 }
@@ -679,12 +666,9 @@ req0_ctx_send(void *arg, nni_aio *aio)
 		return;
 	}
 	ctx->request_id = (uint32_t) id;
-	if ((rv = nni_msg_header_append_u32(msg, ctx->request_id)) != 0) {
-		nni_idhash_remove(s->requests, id);
-		nni_mtx_unlock(&s->mtx);
-		nni_aio_finish_error(aio, rv);
-		return;
-	}
+	nni_msg_header_clear(msg);
+	nni_msg_header_append_u32(msg, ctx->request_id);
+
 	// If no pipes are ready, and the request was a poll (no background
 	// schedule), then fail it.  Should be NNG_ETIMEDOUT.
 	rv = nni_aio_schedule(aio, req0_ctx_cancel_send, ctx);
@@ -726,7 +710,7 @@ req0_sock_set_max_ttl(void *arg, const void *buf, size_t sz, nni_opt_type t)
 	req0_sock *s = arg;
 	int        ttl;
 	int        rv;
-	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, 255, t)) == 0) {
+	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, NNI_MAX_MAX_TTL, t)) == 0) {
 		nni_atomic_set(&s->ttl, ttl);
 	}
 	return (rv);
@@ -851,8 +835,8 @@ static nni_proto_sock_ops req0_sock_ops = {
 
 static nni_proto req0_proto = {
 	.proto_version  = NNI_PROTOCOL_VERSION,
-	.proto_self     = { NNI_PROTO_REQ_V0, "req" },
-	.proto_peer     = { NNI_PROTO_REP_V0, "rep" },
+	.proto_self     = { NNG_REQ0_SELF, NNG_REQ0_SELF_NAME },
+	.proto_peer     = { NNG_REQ0_PEER, NNG_REQ0_PEER_NAME },
 	.proto_flags    = NNI_PROTO_FLAG_SNDRCV | NNI_PROTO_FLAG_NOMSGQ,
 	.proto_sock_ops = &req0_sock_ops,
 	.proto_pipe_ops = &req0_pipe_ops,

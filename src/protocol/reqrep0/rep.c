@@ -8,7 +8,6 @@
 // found online at https://opensource.org/licenses/MIT.
 //
 
-#include <stdlib.h>
 #include <string.h>
 
 #include "core/nng_impl.h"
@@ -17,14 +16,6 @@
 // Response protocol.  The REP protocol is the "reply" side of a
 // request-reply pair.  This is useful for building RPC servers, for
 // example.
-
-#ifndef NNI_PROTO_REQ_V0
-#define NNI_PROTO_REQ_V0 NNI_PROTO(3, 0)
-#endif
-
-#ifndef NNI_PROTO_REP_V0
-#define NNI_PROTO_REP_V0 NNI_PROTO(3, 1)
-#endif
 
 typedef struct rep0_pipe rep0_pipe;
 typedef struct rep0_sock rep0_sock;
@@ -43,7 +34,7 @@ struct rep0_ctx {
 	nni_list_node sqnode;
 	nni_list_node rqnode;
 	size_t        btrace_len;
-	uint32_t      btrace[256]; // backtrace buffer
+	uint32_t      btrace[NNI_MAX_MAX_TTL + 1];
 };
 
 // rep0_sock is our per-socket protocol private structure.
@@ -315,7 +306,7 @@ rep0_pipe_start(void *arg)
 	rep0_sock *s = p->rep;
 	int        rv;
 
-	if (nni_pipe_peer(p->pipe) != NNI_PROTO_REQ_V0) {
+	if (nni_pipe_peer(p->pipe) != NNG_REP0_PEER) {
 		// Peer protocol mismatch.
 		return (NNG_EPROTO);
 	}
@@ -491,6 +482,7 @@ rep0_pipe_recv_cb(void *arg)
 	nni_aio *  aio;
 	size_t     len;
 	int        hops;
+	int        ttl;
 
 	if (nni_aio_result(&p->aio_recv) != 0) {
 		nni_pipe_close(p->pipe);
@@ -498,6 +490,7 @@ rep0_pipe_recv_cb(void *arg)
 	}
 
 	msg = nni_aio_get_msg(&p->aio_recv);
+	ttl = nni_atomic_get(&s->ttl);
 
 	nni_msg_set_pipe(msg, p->id);
 
@@ -506,7 +499,7 @@ rep0_pipe_recv_cb(void *arg)
 	for (;;) {
 		bool end;
 
-		if (hops > nni_atomic_get(&s->ttl)) {
+		if (hops > ttl) {
 			// This isn't malformed, but it has gone
 			// through too many hops.  Do not disconnect,
 			// because we can legitimately receive messages
@@ -577,10 +570,10 @@ static int
 rep0_sock_set_max_ttl(void *arg, const void *buf, size_t sz, nni_opt_type t)
 {
 	rep0_sock *s = arg;
-	int ttl;
-	int rv;
+	int        ttl;
+	int        rv;
 
-	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, 255, t)) == 0) {
+	if ((rv = nni_copyin_int(&ttl, buf, sz, 1, NNI_MAX_MAX_TTL, t)) == 0) {
 		nni_atomic_set(&s->ttl, ttl);
 	}
 	return (rv);
@@ -689,8 +682,8 @@ static nni_proto_sock_ops rep0_sock_ops = {
 
 static nni_proto rep0_proto = {
 	.proto_version  = NNI_PROTOCOL_VERSION,
-	.proto_self     = { NNI_PROTO_REP_V0, "rep" },
-	.proto_peer     = { NNI_PROTO_REQ_V0, "req" },
+	.proto_self     = { NNG_REP0_SELF, NNG_REP0_SELF_NAME },
+	.proto_peer     = { NNG_REP0_PEER, NNG_REP0_PEER_NAME },
 	.proto_flags    = NNI_PROTO_FLAG_SNDRCV | NNI_PROTO_FLAG_NOMSGQ,
 	.proto_sock_ops = &rep0_sock_ops,
 	.proto_pipe_ops = &rep0_pipe_ops,
